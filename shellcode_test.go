@@ -34,7 +34,7 @@ func TestDylibToShellcode_Arm64Darwin(t *testing.T) {
 	}
 
 	sc, err := beignet.DylibFileToShellcode(dylibPath, beignet.Options{
-		EntrySymbol: "_BeignetEntry",
+		EntrySymbol: "_StartW",
 	})
 	if err != nil {
 		t.Fatalf("DylibFileToShellcode: %v", err)

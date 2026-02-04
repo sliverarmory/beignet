@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	defaultEntrySymbol = "_BeignetEntry"
+	defaultEntrySymbol = "_StartW"
 )
 
 var (
@@ -21,7 +21,7 @@ var (
 )
 
 type Options struct {
-	// EntrySymbol is the symbol name to resolve in the loaded module (e.g. "_BeignetEntry").
+	// EntrySymbol is the symbol name to resolve in the loaded module (e.g. "_StartW").
 	// If provided without a leading underscore, one is added.
 	EntrySymbol string
 }

@@ -11,9 +11,14 @@ import (
 
 const markerPath = "/tmp/beignet_test_marker"
 
+//export StartW
+func StartW() {
+	_ = os.WriteFile(markerPath, []byte("ok"), 0o600)
+}
+
 //export BeignetEntry
 func BeignetEntry() {
-	_ = os.WriteFile(markerPath, []byte("ok"), 0o600)
+	StartW()
 }
 
 func main() {}

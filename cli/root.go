@@ -30,7 +30,7 @@ var rootCmd = &cobra.Command{
 
 func init() {
 	rootCmd.Flags().StringVarP(&outPath, "out", "o", "payload.bin", "Output file path for the raw shellcode buffer")
-	rootCmd.Flags().StringVar(&entrySymbol, "entry", "", "Entry symbol to resolve in the dylib (default: _BeignetEntry)")
+	rootCmd.Flags().StringVar(&entrySymbol, "entry", "", "Entry symbol to resolve in the dylib (default: _StartW)")
 
 	rootCmd.AddCommand(dumpLoaderCCmd)
 }
