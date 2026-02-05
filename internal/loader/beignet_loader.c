@@ -278,6 +278,290 @@ static void* memcpy2(void* dest, const void* src, size_t len)
   return dest;
 }
 
+/*
+ * aPLib compression library  -  the smaller the better :)
+ *
+ * C safe depacker (based on internal/stager/aplib/src/depacks.c)
+ *
+ * Copyright (c) 1998-2014 Joergen Ibsen
+ * All Rights Reserved
+ *
+ * http://www.ibsensoftware.com/
+ */
+
+#ifndef APLIB_ERROR
+#define APLIB_ERROR ((unsigned int) (-1))
+#endif
+
+struct APDSSTATE {
+  const unsigned char* source;
+  unsigned int srclen;
+  unsigned char* destination;
+  unsigned int dstlen;
+  unsigned int tag;
+  unsigned int bitcount;
+};
+
+static int aP_getbit_safe(struct APDSSTATE* ud, unsigned int* result)
+{
+  unsigned int bit;
+
+  /* check if tag is empty */
+  if (!ud->bitcount--) {
+    if (!ud->srclen--) {
+      return 0;
+    }
+
+    /* load next tag */
+    ud->tag = *ud->source++;
+    ud->bitcount = 7;
+  }
+
+  /* shift bit out of tag */
+  bit = (ud->tag >> 7) & 0x01;
+  ud->tag <<= 1;
+
+  *result = bit;
+
+  return 1;
+}
+
+static int aP_getgamma_safe(struct APDSSTATE* ud, unsigned int* result)
+{
+  unsigned int bit;
+  unsigned int v = 1;
+
+  /* input gamma2-encoded bits */
+  do {
+    if (!aP_getbit_safe(ud, &bit)) {
+      return 0;
+    }
+
+    if (v & 0x80000000) {
+      return 0;
+    }
+
+    v = (v << 1) + bit;
+
+    if (!aP_getbit_safe(ud, &bit)) {
+      return 0;
+    }
+  } while (bit);
+
+  *result = v;
+
+  return 1;
+}
+
+static unsigned int aP_depack_safe(const void* source, unsigned int srclen, void* destination, unsigned int dstlen)
+{
+  struct APDSSTATE ud;
+  unsigned int offs, len, R0, LWM, bit;
+  int done;
+  int i;
+
+  if (!source || !destination) {
+    return APLIB_ERROR;
+  }
+
+  ud.source = (const unsigned char*)source;
+  ud.srclen = srclen;
+  ud.destination = (unsigned char*)destination;
+  ud.dstlen = dstlen;
+  ud.bitcount = 0;
+
+  R0 = (unsigned int)-1;
+  LWM = 0;
+  done = 0;
+
+  /* first byte verbatim */
+  if (!ud.srclen-- || !ud.dstlen--) {
+    return APLIB_ERROR;
+  }
+  *ud.destination++ = *ud.source++;
+
+  /* main decompression loop */
+  while (!done) {
+    if (!aP_getbit_safe(&ud, &bit)) {
+      return APLIB_ERROR;
+    }
+
+    if (bit) {
+      if (!aP_getbit_safe(&ud, &bit)) {
+        return APLIB_ERROR;
+      }
+
+      if (bit) {
+        if (!aP_getbit_safe(&ud, &bit)) {
+          return APLIB_ERROR;
+        }
+
+        if (bit) {
+          offs = 0;
+
+          for (i = 4; i; i--) {
+            if (!aP_getbit_safe(&ud, &bit)) {
+              return APLIB_ERROR;
+            }
+            offs = (offs << 1) + bit;
+          }
+
+          if (offs) {
+            if (offs > (dstlen - ud.dstlen)) {
+              return APLIB_ERROR;
+            }
+
+            if (!ud.dstlen--) {
+              return APLIB_ERROR;
+            }
+
+            *ud.destination = *(ud.destination - offs);
+            ud.destination++;
+          } else {
+            if (!ud.dstlen--) {
+              return APLIB_ERROR;
+            }
+
+            *ud.destination++ = 0x00;
+          }
+
+          LWM = 0;
+        } else {
+          if (!ud.srclen--) {
+            return APLIB_ERROR;
+          }
+
+          offs = *ud.source++;
+
+          len = 2 + (offs & 0x0001);
+
+          offs >>= 1;
+
+          if (offs) {
+            if (offs > (dstlen - ud.dstlen)) {
+              return APLIB_ERROR;
+            }
+
+            if (len > ud.dstlen) {
+              return APLIB_ERROR;
+            }
+
+            ud.dstlen -= len;
+
+            for (; len; len--) {
+              *ud.destination = *(ud.destination - offs);
+              ud.destination++;
+            }
+          } else {
+            done = 1;
+          }
+
+          R0 = offs;
+          LWM = 1;
+        }
+      } else {
+        if (!aP_getgamma_safe(&ud, &offs)) {
+          return APLIB_ERROR;
+        }
+
+        if ((LWM == 0) && (offs == 2)) {
+          offs = R0;
+
+          if (!aP_getgamma_safe(&ud, &len)) {
+            return APLIB_ERROR;
+          }
+
+          if (offs > (dstlen - ud.dstlen)) {
+            return APLIB_ERROR;
+          }
+
+          if (len > ud.dstlen) {
+            return APLIB_ERROR;
+          }
+
+          ud.dstlen -= len;
+
+          for (; len; len--) {
+            *ud.destination = *(ud.destination - offs);
+            ud.destination++;
+          }
+        } else {
+          if (LWM == 0) {
+            offs -= 3;
+          } else {
+            offs -= 2;
+          }
+
+          if (offs > 0x00fffffe) {
+            return APLIB_ERROR;
+          }
+
+          if (!ud.srclen--) {
+            return APLIB_ERROR;
+          }
+
+          offs <<= 8;
+          offs += *ud.source++;
+
+          if (!aP_getgamma_safe(&ud, &len)) {
+            return APLIB_ERROR;
+          }
+
+          if (offs >= 32000) {
+            len++;
+          }
+          if (offs >= 1280) {
+            len++;
+          }
+          if (offs < 128) {
+            len += 2;
+          }
+
+          if (offs > (dstlen - ud.dstlen)) {
+            return APLIB_ERROR;
+          }
+
+          if (len > ud.dstlen) {
+            return APLIB_ERROR;
+          }
+
+          ud.dstlen -= len;
+
+          for (; len; len--) {
+            *ud.destination = *(ud.destination - offs);
+            ud.destination++;
+          }
+
+          R0 = offs;
+        }
+
+        LWM = 1;
+      }
+    } else {
+      if (!ud.srclen-- || !ud.dstlen--) {
+        return APLIB_ERROR;
+      }
+      *ud.destination++ = *ud.source++;
+      LWM = 0;
+    }
+  }
+
+  return (unsigned int)(ud.destination - (unsigned char*)destination);
+}
+
+#define APLIB_SAFE_TAG 0x32335041u /* 'AP32' */
+#define APLIB_SAFE_HEADER_MIN 24u
+
+struct aplib_safe_header
+{
+  uint32_t tag;
+  uint32_t header_size;
+  uint32_t packed_size;
+  uint32_t packed_crc;
+  uint32_t orig_size;
+  uint32_t orig_crc;
+};
+
 static uint64_t syscall_shared_region_check_np()
 {
   long shared_region_check_np = 0x2000126; // #294
@@ -536,6 +820,41 @@ __attribute__((used, noinline)) int beignet_loader(void* buffer_ro, uint64_t buf
   }
 
   uint64_t buffer = (uint64_t)buffer_ro;
+  uint64_t bufferLen = buffer_size;
+
+  // If the staged buffer is aPLib safe-packed ("AP32"), depack it before handing
+  // it to dyld4's Mach-O analyzers.
+  if (bufferLen >= APLIB_SAFE_HEADER_MIN) {
+    const struct aplib_safe_header* hdr = (const struct aplib_safe_header*)(uintptr_t)buffer;
+    if (hdr->tag == APLIB_SAFE_TAG) {
+      uint64_t headerSize = (uint64_t)hdr->header_size;
+      uint64_t packedSize = (uint64_t)hdr->packed_size;
+      uint64_t origSize = (uint64_t)hdr->orig_size;
+
+      if (headerSize < APLIB_SAFE_HEADER_MIN || headerSize > bufferLen) {
+        return 14;
+      }
+      if (packedSize == 0 || packedSize > (bufferLen - headerSize)) {
+        return 14;
+      }
+      if (origSize == 0) {
+        return 14;
+      }
+
+      void* depacked = MMap_func(sdg, 0, (size_t)origSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+      if (depacked == (void*)-1 || depacked == 0) {
+        return 15;
+      }
+      const void* packedData = (const void*)(uintptr_t)(buffer + headerSize);
+      unsigned int outlen = aP_depack_safe(packedData, (unsigned int)packedSize, depacked, (unsigned int)origSize);
+      if (outlen != (unsigned int)origSize) {
+        return 15;
+      }
+
+      buffer = (uint64_t)(uintptr_t)depacked;
+      bufferLen = origSize;
+    }
+  }
 
   // Allocate a region large enough for the mapped Mach-O.
   uintptr_t vmSpace = 0;

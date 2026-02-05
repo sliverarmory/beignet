@@ -33,18 +33,6 @@ func TestDylibToShellcode_Arm64Darwin(t *testing.T) {
 		}
 	}
 
-	sc, err := beignet.DylibFileToShellcode(dylibPath, beignet.Options{
-		EntrySymbol: "_StartW",
-	})
-	if err != nil {
-		t.Fatalf("DylibFileToShellcode: %v", err)
-	}
-
-	shellcodePath := filepath.Join(tmp, "shellcode.bin")
-	if err := os.WriteFile(shellcodePath, sc, 0o644); err != nil {
-		t.Fatalf("write shellcode: %v", err)
-	}
-
 	runnerPath := filepath.Join(tmp, "runner")
 	{
 		zigCache := filepath.Join(tmp, "zig-cache")
@@ -62,19 +50,47 @@ func TestDylibToShellcode_Arm64Darwin(t *testing.T) {
 		}
 	}
 
-	_ = os.Remove(markerPath)
-
-	cmd := exec.Command(runnerPath, shellcodePath)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("runner failed: %v\n%s", err, out)
+	cases := []struct {
+		name string
+		opts beignet.Options
+	}{
+		{
+			name: "raw",
+			opts: beignet.Options{EntrySymbol: "_StartW"},
+		},
+		{
+			name: "aplib",
+			opts: beignet.Options{EntrySymbol: "_StartW", Compress: true},
+		},
 	}
 
-	got, err := os.ReadFile(markerPath)
-	if err != nil {
-		t.Fatalf("marker not written: %v", err)
-	}
-	if !bytes.Equal(bytes.TrimSpace(got), []byte("ok")) {
-		t.Fatalf("unexpected marker contents: %q", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sc, err := beignet.DylibFileToShellcode(dylibPath, tc.opts)
+			if err != nil {
+				t.Fatalf("DylibFileToShellcode: %v", err)
+			}
+
+			shellcodePath := filepath.Join(tmp, "shellcode-"+tc.name+".bin")
+			if err := os.WriteFile(shellcodePath, sc, 0o644); err != nil {
+				t.Fatalf("write shellcode: %v", err)
+			}
+
+			_ = os.Remove(markerPath)
+
+			cmd := exec.Command(runnerPath, shellcodePath)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("runner failed: %v\n%s", err, out)
+			}
+
+			got, err := os.ReadFile(markerPath)
+			if err != nil {
+				t.Fatalf("marker not written: %v", err)
+			}
+			if !bytes.Equal(bytes.TrimSpace(got), []byte("ok")) {
+				t.Fatalf("unexpected marker contents: %q", got)
+			}
+		})
 	}
 }

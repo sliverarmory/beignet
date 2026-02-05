@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/sliverarmory/beignet/internal/aplib"
 	"github.com/sliverarmory/beignet/internal/stager"
 )
 
@@ -24,6 +25,10 @@ type Options struct {
 	// EntrySymbol is the symbol name to resolve in the loaded module (e.g. "_StartW").
 	// If provided without a leading underscore, one is added.
 	EntrySymbol string
+
+	// Compress enables aPLib "AP32" safe-packed compression for the staged dylib
+	// buffer. This reduces shellcode size and requires the embedded loader.
+	Compress bool
 }
 
 func DylibFileToShellcode(path string, opts Options) ([]byte, error) {
@@ -41,6 +46,15 @@ func DylibToShellcode(dylib []byte, opts Options) ([]byte, error) {
 	entrySymbol, err := normalizeEntrySymbol(opts.EntrySymbol)
 	if err != nil {
 		return nil, err
+	}
+
+	payload := dylib
+	if opts.Compress {
+		packed, err := aplib.PackSafe(dylib)
+		if err != nil {
+			return nil, fmt.Errorf("beignet: aplib compress: %w", err)
+		}
+		payload = packed
 	}
 
 	loaderText, loaderEntryOff, err := stager.LoaderText()
@@ -63,7 +77,7 @@ func DylibToShellcode(dylib []byte, opts Options) ([]byte, error) {
 	loaderEntryAbs := loaderStart + loaderEntryOff
 
 	payloadStart := alignUp(loaderStart+uint64(len(loaderText)), 16)
-	payloadSize := uint64(len(dylib))
+	payloadSize := uint64(len(payload))
 	entrySymbolStart := payloadStart + payloadSize
 
 	bootstrap, err = buildArm64Bootstrap(payloadStart, payloadSize, entrySymbolStart, loaderEntryAbs)
@@ -86,7 +100,7 @@ func DylibToShellcode(dylib []byte, opts Options) ([]byte, error) {
 		out = append(out, make([]byte, padLen)...)
 	}
 
-	out = append(out, dylib...)
+	out = append(out, payload...)
 	out = append(out, entrySymbol...)
 	out = append(out, 0) // NUL-terminate symbol name
 
