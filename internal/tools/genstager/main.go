@@ -90,7 +90,7 @@ func main() {
 		fatal(err)
 	}
 
-	outGo := filepath.Join(*outDir, "stager_darwin_arm64.go")
+	outGo := filepath.Join(*outDir, "stager_darwin_arm64_gen.go")
 	if err := os.WriteFile(outGo, []byte(renderGo(entryOffset)), 0o644); err != nil {
 		fatal(err)
 	}

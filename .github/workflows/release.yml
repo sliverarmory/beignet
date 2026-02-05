@@ -44,7 +44,7 @@ jobs:
         run: |
           set -euo pipefail
           test -f internal/stager/stager_darwin_arm64.bin
-          test -f internal/stager/stager_darwin_arm64.go
+          test -f internal/stager/stager_darwin_arm64_gen.go
 
       - name: Upload stager
         uses: actions/upload-artifact@v4
@@ -52,7 +52,7 @@ jobs:
           name: stager-darwin-arm64
           path: |
             internal/stager/stager_darwin_arm64.bin
-            internal/stager/stager_darwin_arm64.go
+            internal/stager/stager_darwin_arm64_gen.go
           if-no-files-found: error
           retention-days: 5
 
@@ -98,19 +98,19 @@ jobs:
       - name: Install stager
         run: |
           set -euo pipefail
-          rm -f internal/stager/stager_darwin_arm64.bin internal/stager/stager_darwin_arm64.go
+          rm -f internal/stager/stager_darwin_arm64.bin internal/stager/stager_darwin_arm64_gen.go
 
           bin_path="$(find .stager-artifact -type f -name 'stager_darwin_arm64.bin' -print -quit)"
-          go_path="$(find .stager-artifact -type f -name 'stager_darwin_arm64.go' -print -quit)"
+          go_path="$(find .stager-artifact -type f -name 'stager_darwin_arm64_gen.go' -print -quit)"
 
           test -n "${bin_path}"
           test -n "${go_path}"
 
           cp "${bin_path}" internal/stager/stager_darwin_arm64.bin
-          cp "${go_path}" internal/stager/stager_darwin_arm64.go
+          cp "${go_path}" internal/stager/stager_darwin_arm64_gen.go
 
           test -f internal/stager/stager_darwin_arm64.bin
-          test -f internal/stager/stager_darwin_arm64.go
+          test -f internal/stager/stager_darwin_arm64_gen.go
 
       - name: Go Build
         run: |
@@ -162,19 +162,19 @@ jobs:
       - name: Install stager
         run: |
           set -euo pipefail
-          rm -f internal/stager/stager_darwin_arm64.bin internal/stager/stager_darwin_arm64.go
+          rm -f internal/stager/stager_darwin_arm64.bin internal/stager/stager_darwin_arm64_gen.go
 
           bin_path="$(find .stager-artifact -type f -name 'stager_darwin_arm64.bin' -print -quit)"
-          go_path="$(find .stager-artifact -type f -name 'stager_darwin_arm64.go' -print -quit)"
+          go_path="$(find .stager-artifact -type f -name 'stager_darwin_arm64_gen.go' -print -quit)"
 
           test -n "${bin_path}"
           test -n "${go_path}"
 
           cp "${bin_path}" internal/stager/stager_darwin_arm64.bin
-          cp "${go_path}" internal/stager/stager_darwin_arm64.go
+          cp "${go_path}" internal/stager/stager_darwin_arm64_gen.go
 
           test -f internal/stager/stager_darwin_arm64.bin
-          test -f internal/stager/stager_darwin_arm64.go
+          test -f internal/stager/stager_darwin_arm64_gen.go
 
       - name: Go Build
         run: |
@@ -221,19 +221,19 @@ jobs:
       - name: Install stager
         run: |
           set -euo pipefail
-          rm -f internal/stager/stager_darwin_arm64.bin internal/stager/stager_darwin_arm64.go
+          rm -f internal/stager/stager_darwin_arm64.bin internal/stager/stager_darwin_arm64_gen.go
 
           bin_path="$(find .stager-artifact -type f -name 'stager_darwin_arm64.bin' -print -quit)"
-          go_path="$(find .stager-artifact -type f -name 'stager_darwin_arm64.go' -print -quit)"
+          go_path="$(find .stager-artifact -type f -name 'stager_darwin_arm64_gen.go' -print -quit)"
 
           test -n "${bin_path}"
           test -n "${go_path}"
 
           cp "${bin_path}" internal/stager/stager_darwin_arm64.bin
-          cp "${go_path}" internal/stager/stager_darwin_arm64.go
+          cp "${go_path}" internal/stager/stager_darwin_arm64_gen.go
 
           test -f internal/stager/stager_darwin_arm64.bin
-          test -f internal/stager/stager_darwin_arm64.go
+          test -f internal/stager/stager_darwin_arm64_gen.go
 
       - name: Go Build
         run: |
@@ -280,19 +280,19 @@ jobs:
       - name: Install stager
         run: |
           set -euo pipefail
-          rm -f internal/stager/stager_darwin_arm64.bin internal/stager/stager_darwin_arm64.go
+          rm -f internal/stager/stager_darwin_arm64.bin internal/stager/stager_darwin_arm64_gen.go
 
           bin_path="$(find .stager-artifact -type f -name 'stager_darwin_arm64.bin' -print -quit)"
-          go_path="$(find .stager-artifact -type f -name 'stager_darwin_arm64.go' -print -quit)"
+          go_path="$(find .stager-artifact -type f -name 'stager_darwin_arm64_gen.go' -print -quit)"
 
           test -n "${bin_path}"
           test -n "${go_path}"
 
           cp "${bin_path}" internal/stager/stager_darwin_arm64.bin
-          cp "${go_path}" internal/stager/stager_darwin_arm64.go
+          cp "${go_path}" internal/stager/stager_darwin_arm64_gen.go
 
           test -f internal/stager/stager_darwin_arm64.bin
-          test -f internal/stager/stager_darwin_arm64.go
+          test -f internal/stager/stager_darwin_arm64_gen.go
 
       - name: Go Build
         run: |
@@ -344,19 +344,19 @@ jobs:
       - name: Install stager
         run: |
           set -euo pipefail
-          rm -f internal/stager/stager_darwin_arm64.bin internal/stager/stager_darwin_arm64.go
+          rm -f internal/stager/stager_darwin_arm64.bin internal/stager/stager_darwin_arm64_gen.go
 
           bin_path="$(find .stager-artifact -type f -name 'stager_darwin_arm64.bin' -print -quit)"
-          go_path="$(find .stager-artifact -type f -name 'stager_darwin_arm64.go' -print -quit)"
+          go_path="$(find .stager-artifact -type f -name 'stager_darwin_arm64_gen.go' -print -quit)"
 
           test -n "${bin_path}"
           test -n "${go_path}"
 
           cp "${bin_path}" internal/stager/stager_darwin_arm64.bin
-          cp "${go_path}" internal/stager/stager_darwin_arm64.go
+          cp "${go_path}" internal/stager/stager_darwin_arm64_gen.go
 
           test -f internal/stager/stager_darwin_arm64.bin
-          test -f internal/stager/stager_darwin_arm64.go
+          test -f internal/stager/stager_darwin_arm64_gen.go
 
       - name: Go Build
         run: |
@@ -408,19 +408,19 @@ jobs:
       - name: Install stager
         run: |
           set -euo pipefail
-          rm -f internal/stager/stager_darwin_arm64.bin internal/stager/stager_darwin_arm64.go
+          rm -f internal/stager/stager_darwin_arm64.bin internal/stager/stager_darwin_arm64_gen.go
 
           bin_path="$(find .stager-artifact -type f -name 'stager_darwin_arm64.bin' -print -quit)"
-          go_path="$(find .stager-artifact -type f -name 'stager_darwin_arm64.go' -print -quit)"
+          go_path="$(find .stager-artifact -type f -name 'stager_darwin_arm64_gen.go' -print -quit)"
 
           test -n "${bin_path}"
           test -n "${go_path}"
 
           cp "${bin_path}" internal/stager/stager_darwin_arm64.bin
-          cp "${go_path}" internal/stager/stager_darwin_arm64.go
+          cp "${go_path}" internal/stager/stager_darwin_arm64_gen.go
 
           test -f internal/stager/stager_darwin_arm64.bin
-          test -f internal/stager/stager_darwin_arm64.go
+          test -f internal/stager/stager_darwin_arm64_gen.go
 
       - name: Go Build
         run: |
