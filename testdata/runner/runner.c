@@ -3,6 +3,8 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <dlfcn.h>
+#include <execinfo.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/ucontext.h>
@@ -28,6 +30,38 @@ static void segv_handler(int sig, siginfo_t* info, void* uap) {
   if (g_shellcode_base) {
     fprintf(stderr, "pc_offset=0x%lx\n",
             (unsigned long)(pc - (uintptr_t)g_shellcode_base));
+  }
+#elif defined(__x86_64__)
+  uintptr_t rip = (uintptr_t)uc->uc_mcontext->__ss.__rip;
+  uintptr_t rsp = (uintptr_t)uc->uc_mcontext->__ss.__rsp;
+  uintptr_t rax = (uintptr_t)uc->uc_mcontext->__ss.__rax;
+  uintptr_t rbx = (uintptr_t)uc->uc_mcontext->__ss.__rbx;
+  uintptr_t rcx = (uintptr_t)uc->uc_mcontext->__ss.__rcx;
+  uintptr_t rdx = (uintptr_t)uc->uc_mcontext->__ss.__rdx;
+  uintptr_t rdi = (uintptr_t)uc->uc_mcontext->__ss.__rdi;
+  uintptr_t rsi = (uintptr_t)uc->uc_mcontext->__ss.__rsi;
+  fprintf(stderr, "SIGSEGV rip=%p rsp=%p fault=%p\n", (void*)rip, (void*)rsp,
+          info ? info->si_addr : 0);
+  fprintf(stderr, "regs rax=%p rbx=%p rcx=%p rdx=%p rdi=%p rsi=%p\n",
+          (void*)rax, (void*)rbx, (void*)rcx, (void*)rdx, (void*)rdi,
+          (void*)rsi);
+  Dl_info dli;
+  if (dladdr((void*)rip, &dli) != 0) {
+    const char* fname = dli.dli_fname ? dli.dli_fname : "?";
+    const char* sname = dli.dli_sname ? dli.dli_sname : "?";
+    uintptr_t fbase = (uintptr_t)dli.dli_fbase;
+    uintptr_t saddr = (uintptr_t)dli.dli_saddr;
+    fprintf(stderr, "dladdr image=%s base=%p\n", fname, (void*)fbase);
+    fprintf(stderr, "dladdr sym=%s addr=%p+0x%lx\n", sname, (void*)saddr,
+            (unsigned long)(rip - saddr));
+  }
+  void* bt[64];
+  int bt_n = backtrace(bt, 64);
+  fprintf(stderr, "backtrace n=%d\n", bt_n);
+  backtrace_symbols_fd(bt, bt_n, STDERR_FILENO);
+  if (g_shellcode_base) {
+    fprintf(stderr, "rip_offset=0x%lx\n",
+            (unsigned long)(rip - (uintptr_t)g_shellcode_base));
   }
 #else
   fprintf(stderr, "SIGSEGV fault=%p\n", info ? info->si_addr : 0);

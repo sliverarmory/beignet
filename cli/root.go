@@ -15,7 +15,7 @@ var (
 
 var rootCmd = &cobra.Command{
 	Use:          "beignet <payload.dylib>",
-	Short:        "Convert a darwin/arm64 dylib into a shellcode buffer",
+	Short:        "Convert a darwin dylib (arm64/amd64) into a shellcode buffer",
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
