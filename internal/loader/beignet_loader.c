@@ -1050,7 +1050,7 @@ __attribute__((used, noinline)) int beignet_loader(void* buffer_ro, uint64_t buf
     return 5;
   }
 
-  void* loadAddressP = syscall_mmap(0, vmSpace, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  void* loadAddressP = syscall_mmap(0, vmSpace, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
   if (loadAddressP == (void*)-1 || loadAddressP == 0) {
     return 6;
   }
@@ -1069,11 +1069,10 @@ __attribute__((used, noinline)) int beignet_loader(void* buffer_ro, uint64_t buf
         continue;
       }
       int perms = (int)region.perms;
-      void* segAddress = syscall_mmap((void*)(loadAddress + region.vmOffset), region.fileSize, PROT_WRITE,
-                                  MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0);
-      if (segAddress == (void*)-1 || segAddress == 0) {
+      if ((region.vmOffset >= vmSpace) || (region.fileSize > (vmSpace - region.vmOffset))) {
         continue;
       }
+      void* segAddress = (void*)(loadAddress + region.vmOffset);
       memcpy2(segAddress, (const void*)(buffer + sliceOffset + region.fileOffset), (size_t)region.fileSize);
       syscall_mprotect(segAddress, region.fileSize, perms);
       ++segIndex;
