@@ -1,11 +1,42 @@
 package beignet
 
 import (
-	"encoding/binary"
 	"fmt"
+	"strings"
+	"sync"
+
+	keystone "github.com/moloch--/go-keystone"
 )
 
 const amd64BootstrapLen = 59
+
+var (
+	amd64KeystoneOnce sync.Once
+	amd64KeystoneEng  *keystone.Engine
+	amd64KeystoneErr  error
+	amd64KeystoneMu   sync.Mutex
+)
+
+func amd64Assembler() (*keystone.Engine, error) {
+	amd64KeystoneOnce.Do(func() {
+		amd64KeystoneEng, amd64KeystoneErr = keystone.NewEngine(keystone.ARCH_X86, keystone.MODE_64)
+		if amd64KeystoneErr != nil {
+			return
+		}
+		amd64KeystoneErr = amd64KeystoneEng.Option(keystone.OPT_SYNTAX, keystone.OPT_SYNTAX_INTEL)
+	})
+	return amd64KeystoneEng, amd64KeystoneErr
+}
+
+func assembleAMD64(src string) ([]byte, error) {
+	eng, err := amd64Assembler()
+	if err != nil {
+		return nil, err
+	}
+	amd64KeystoneMu.Lock()
+	defer amd64KeystoneMu.Unlock()
+	return eng.Assemble(src, 0)
+}
 
 // buildAMD64Bootstrap returns a small x86_64 stub which:
 // - sets rdi = base + payloadOffset
@@ -13,40 +44,37 @@ const amd64BootstrapLen = 59
 // - sets rdx = base + symbolOffset
 // - calls base + loaderEntryOffsetAbs (then returns to the caller)
 func buildAMD64Bootstrap(payloadOffset, payloadSize, symbolOffset, loaderEntryOffsetAbs uint64) ([]byte, error) {
-	b := make([]byte, 0, amd64BootstrapLen)
+	var sb strings.Builder
+	sb.Grow(256)
+	sb.WriteString(".code64\n")
 
-	// lea r9, [rip-7] ; recover the shellcode base (start of this instruction)
-	b = append(b, 0x4c, 0x8d, 0x0d, 0xf9, 0xff, 0xff, 0xff)
+	// Recover the shellcode base as the start of this bootstrap.
+	sb.WriteString("lea r9, [rip - 7]\n")
 
 	// rdi = base + payloadOffset
-	b = append(b, 0x48, 0xbf)
-	b = appendU64LE(b, payloadOffset)
-	b = append(b, 0x4c, 0x01, 0xcf) // add rdi, r9
+	fmt.Fprintf(&sb, "movabs rdi, 0x%X\n", payloadOffset)
+	sb.WriteString("add rdi, r9\n")
 
 	// rsi = payloadSize
-	b = append(b, 0x48, 0xbe)
-	b = appendU64LE(b, payloadSize)
+	fmt.Fprintf(&sb, "movabs rsi, 0x%X\n", payloadSize)
 
 	// rdx = base + symbolOffset
-	b = append(b, 0x48, 0xba)
-	b = appendU64LE(b, symbolOffset)
-	b = append(b, 0x4c, 0x01, 0xca) // add rdx, r9
+	fmt.Fprintf(&sb, "movabs rdx, 0x%X\n", symbolOffset)
+	sb.WriteString("add rdx, r9\n")
 
 	// rax = base + loaderEntryOffsetAbs
-	b = append(b, 0x48, 0xb8)
-	b = appendU64LE(b, loaderEntryOffsetAbs)
-	b = append(b, 0x4c, 0x01, 0xc8) // add rax, r9
-	b = append(b, 0xff, 0xd0)       // call rax (keeps stack alignment for System V ABI)
-	b = append(b, 0xc3)             // ret
+	fmt.Fprintf(&sb, "movabs rax, 0x%X\n", loaderEntryOffsetAbs)
+	sb.WriteString("add rax, r9\n")
+	sb.WriteString("call rax\n") // keeps stack alignment for System V ABI
+	sb.WriteString("ret\n")
+
+	b, err := assembleAMD64(sb.String())
+	if err != nil {
+		return nil, err
+	}
 
 	if len(b) != amd64BootstrapLen {
 		return nil, fmt.Errorf("beignet: unexpected bootstrap length: got=%d want=%d", len(b), amd64BootstrapLen)
 	}
 	return b, nil
-}
-
-func appendU64LE(out []byte, v uint64) []byte {
-	var imm [8]byte
-	binary.LittleEndian.PutUint64(imm[:], v)
-	return append(out, imm[:]...)
 }
