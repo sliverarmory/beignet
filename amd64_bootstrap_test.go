@@ -71,10 +71,16 @@ func TestBuildAMD64Bootstrap_Layout(t *testing.T) {
 		if !bytes.Equal(got[53:56], []byte{0x4c, 0x01, 0xc8}) {
 			t.Fatalf("case %d: unexpected add rax,r9 opcode", i)
 		}
-		if !bytes.Equal(got[56:58], []byte{0xff, 0xd0}) {
+		if !bytes.Equal(got[56:60], []byte{0x48, 0x83, 0xec, 0x08}) {
+			t.Fatalf("case %d: unexpected sub rsp,8 opcode", i)
+		}
+		if !bytes.Equal(got[60:62], []byte{0xff, 0xd0}) {
 			t.Fatalf("case %d: unexpected call rax opcode", i)
 		}
-		if got[58] != 0xc3 {
+		if !bytes.Equal(got[62:66], []byte{0x48, 0x83, 0xc4, 0x08}) {
+			t.Fatalf("case %d: unexpected add rsp,8 opcode", i)
+		}
+		if got[66] != 0xc3 {
 			t.Fatalf("case %d: unexpected ret opcode", i)
 		}
 	}

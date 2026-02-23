@@ -10,10 +10,9 @@
  *
  * Diskless requirement:
  * - The primary load path must never write to disk (no open/write/unlink temp files).
- * - It uses dyld4's JustInTimeLoader to load a Mach-O image from memory.
- * - On x86_64, we use legacy NS* APIs with an in-memory MH_BUNDLE image.
- *   MH_DYLIB payloads are normalized to MH_BUNDLE in a private copy before
- *   NSCreateObjectFileImageFromMemory() to avoid disk-backed fallback paths.
+ * - arm64 uses dyld4's JustInTimeLoader to load a Mach-O image from memory.
+ * - x86_64 uses a local in-memory mapper + chained-fixups engine and resolves
+ *   imports with dlsym from already-loaded images.
  *
  * Platform:
  * - darwin/arm64 and darwin/amd64
@@ -29,6 +28,65 @@
 // Optional debug output is intentionally disabled in the embedded loader.
 #define print(...) do { } while (0)
 #define printf(...) do { } while (0)
+
+#ifndef LC_DYLD_CHAINED_FIXUPS
+#define LC_DYLD_CHAINED_FIXUPS 0x80000034u
+#endif
+
+struct dyld_chained_fixups_header
+{
+  uint32_t fixups_version;
+  uint32_t starts_offset;
+  uint32_t imports_offset;
+  uint32_t symbols_offset;
+  uint32_t imports_count;
+  uint32_t imports_format;
+  uint32_t symbols_format;
+};
+
+struct dyld_chained_starts_in_image
+{
+  uint32_t seg_count;
+  uint32_t seg_info_offset[1];
+};
+
+struct dyld_chained_starts_in_segment
+{
+  uint32_t size;
+  uint16_t page_size;
+  uint16_t pointer_format;
+  uint64_t segment_offset;
+  uint32_t max_valid_pointer;
+  uint16_t page_count;
+  uint16_t page_start[1];
+};
+
+enum {
+  DYLD_CHAINED_PTR_START_NONE = 0xFFFF,
+  DYLD_CHAINED_PTR_START_MULTI = 0x8000,
+  DYLD_CHAINED_PTR_START_LAST = 0x8000,
+  DYLD_CHAINED_PTR_64_OFFSET = 6,
+  DYLD_CHAINED_IMPORT = 1,
+  DYLD_CHAINED_IMPORT_ADDEND = 2,
+  DYLD_CHAINED_IMPORT_ADDEND64 = 3,
+};
+
+struct dyld_chained_import
+{
+  uint32_t lib_ordinal : 8, weak_import : 1, name_offset : 23;
+};
+
+struct dyld_chained_import_addend
+{
+  uint32_t lib_ordinal : 8, weak_import : 1, name_offset : 23;
+  int32_t addend;
+};
+
+struct dyld_chained_import_addend64
+{
+  uint64_t lib_ordinal : 16, weak_import : 1, reserved : 15, name_offset : 32;
+  uint64_t addend;
+};
 
 struct dyld_cache_header {
   char magic[16];
@@ -253,16 +311,12 @@ typedef void (*DiagnosticsCtor_ptr)(void* diag);
 typedef void (*DiagnosticsClearError_ptr)(void* diag);
 typedef bool (*DiagnosticsHasError_ptr)(const void* diag);
 
-// Legacy dyld API wrappers (exported by libdyld). These are stable and work
-// under Rosetta for x86_64 bundles, whereas the dyld4 internals used below are
-// more fragile across versions/architectures.
-typedef int (*NSCreateObjectFileImageFromMemory_ptr)(const void* mem, size_t size, void** outOFI);
-typedef void* (*NSLinkModule_ptr)(void* ofi, const char* moduleName, uint32_t options);
-typedef void* (*NSLookupSymbolInModule_ptr)(void* module, const char* symbolName);
-typedef void* (*NSAddressOfSymbol_ptr)(void* symbol);
-typedef bool (*NSDestroyObjectFileImage_ptr)(void* ofi);
+typedef void* (*Dlsym_ptr)(void* handle, const char* symbol);
 
 static void* syscall_mmap(void* addr, uint64_t length, int prot, int flags, int fd, uint64_t offset);
+static int syscall_mprotect(void* addr, uint64_t length, int prot);
+static void* find_symbol(uint64_t base, const char* symbol, uint64_t offset);
+static uint64_t find_cache_image(uint64_t shared_region_start, const struct dyld_cache_header* header, const char* wantPath, uint64_t slide);
 
 static int string_compare(const char* s1, const char* s2)
 {
@@ -283,54 +337,628 @@ static void* memcpy2(void* dest, const void* src, size_t len)
   return dest;
 }
 
-static bool prepare_ns_memory_image(const void* src, uint64_t srcLen, void** outImage, uint64_t* outLen)
+static void memzero2(void* dest, size_t len)
 {
-  if (!src || !outImage || !outLen || srcLen < sizeof(struct mach_header_64)) {
+  unsigned char* d = (unsigned char*)dest;
+  while (len--) {
+    *d++ = 0;
+  }
+}
+
+static uint64_t align_up_u64(uint64_t v, uint64_t align)
+{
+  if (align == 0) {
+    return v;
+  }
+  uint64_t mask = align - 1;
+  return (v + mask) & ~mask;
+}
+
+static size_t bounded_cstrlen(const char* s, size_t maxLen)
+{
+  size_t n = 0;
+  while (n < maxLen && s[n] != '\0') {
+    n++;
+  }
+  return n;
+}
+
+#define MAX_MACHO_SEGMENTS 32u
+
+struct MappedSegment {
+  uint64_t vmaddr;
+  uint64_t vmsize;
+  uint64_t fileoff;
+  uint64_t filesize;
+  int initprot;
+};
+
+struct MappedImageX86 {
+  uintptr_t imageBase; // runtime address corresponding to minVmAddr
+  uint64_t minVmAddr;
+  uint64_t maxVmAddr;
+  uint64_t slide;
+  uintptr_t machHeaderAddr;
+  struct MappedSegment segs[MAX_MACHO_SEGMENTS];
+  uint32_t segCount;
+};
+
+static bool map_macho_image_x86(const void* image, uint64_t imageLen, struct MappedImageX86* outImage)
+{
+  if (!image || !outImage || imageLen < sizeof(struct mach_header_64)) {
     return false;
   }
 
-  void* copy = syscall_mmap(0, srcLen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-  if (copy == (void*)-1 || copy == 0) {
-    return false;
-  }
-  memcpy2(copy, src, (size_t)srcLen);
-
-  struct mach_header_64* mh = (struct mach_header_64*)copy;
+  const struct mach_header_64* mh = (const struct mach_header_64*)image;
   if (mh->magic != MH_MAGIC_64) {
     return false;
   }
-  if (mh->sizeofcmds > srcLen || (uint64_t)sizeof(*mh) + (uint64_t)mh->sizeofcmds > srcLen) {
+  if ((uint64_t)sizeof(*mh) + (uint64_t)mh->sizeofcmds > imageLen) {
     return false;
   }
 
-  struct load_command* lc = (struct load_command*)((char*)mh + sizeof(*mh));
+  struct MappedImageX86 mapped;
+  mapped.segCount = 0;
+  mapped.minVmAddr = (uint64_t)-1;
+  mapped.maxVmAddr = 0;
+  mapped.imageBase = 0;
+  mapped.slide = 0;
+  mapped.machHeaderAddr = 0;
+
+  uint64_t headerVmAddr = (uint64_t)-1;
+
+  const struct load_command* lc = (const struct load_command*)((const char*)image + sizeof(*mh));
   uint64_t cmdBytes = mh->sizeofcmds;
-  bool sawIDDylib = false;
   while (cmdBytes >= sizeof(struct load_command)) {
     if (lc->cmdsize < sizeof(struct load_command) || lc->cmdsize > cmdBytes) {
       return false;
     }
-    if (lc->cmd == LC_ID_DYLIB) {
-      sawIDDylib = true;
-      lc->cmd = LC_LAZY_LOAD_DYLIB;
+
+    if (lc->cmd == LC_SEGMENT_64) {
+      const struct segment_command_64* seg = (const struct segment_command_64*)lc;
+      if (seg->vmsize != 0) {
+        if (mapped.segCount >= MAX_MACHO_SEGMENTS) {
+          return false;
+        }
+        if (seg->filesize > 0 && (seg->fileoff > imageLen || seg->filesize > (imageLen - seg->fileoff))) {
+          return false;
+        }
+
+        mapped.segs[mapped.segCount].vmaddr = seg->vmaddr;
+        mapped.segs[mapped.segCount].vmsize = seg->vmsize;
+        mapped.segs[mapped.segCount].fileoff = seg->fileoff;
+        mapped.segs[mapped.segCount].filesize = seg->filesize;
+        mapped.segs[mapped.segCount].initprot = (int)seg->initprot;
+        mapped.segCount++;
+
+        if (seg->vmaddr < mapped.minVmAddr) {
+          mapped.minVmAddr = seg->vmaddr;
+        }
+        uint64_t segEnd = seg->vmaddr + seg->vmsize;
+        if (segEnd < seg->vmaddr) {
+          return false;
+        }
+        if (segEnd > mapped.maxVmAddr) {
+          mapped.maxVmAddr = segEnd;
+        }
+
+        if (seg->fileoff == 0 && seg->filesize >= sizeof(struct mach_header_64)) {
+          headerVmAddr = seg->vmaddr;
+        }
+      }
+    }
+
+    cmdBytes -= lc->cmdsize;
+    lc = (const struct load_command*)((const char*)lc + lc->cmdsize);
+  }
+  if (cmdBytes != 0 || mapped.segCount == 0 || mapped.maxVmAddr <= mapped.minVmAddr || headerVmAddr == (uint64_t)-1) {
+    return false;
+  }
+
+  uint64_t vmSpan = align_up_u64(mapped.maxVmAddr - mapped.minVmAddr, 0x1000);
+  if (vmSpan == 0) {
+    return false;
+  }
+
+  void* mapBaseP = syscall_mmap(0, vmSpan, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  if (mapBaseP == (void*)-1 || mapBaseP == 0) {
+    return false;
+  }
+
+  uintptr_t mapBase = (uintptr_t)mapBaseP;
+  for (uint32_t i = 0; i < mapped.segCount; i++) {
+    const struct MappedSegment* seg = &mapped.segs[i];
+    if (seg->vmaddr < mapped.minVmAddr) {
+      return false;
+    }
+    uintptr_t dst = mapBase + (uintptr_t)(seg->vmaddr - mapped.minVmAddr);
+    if (seg->filesize > 0) {
+      memcpy2((void*)dst, (const void*)((const char*)image + seg->fileoff), (size_t)seg->filesize);
+    }
+    if (seg->vmsize > seg->filesize) {
+      memzero2((void*)(dst + (uintptr_t)seg->filesize), (size_t)(seg->vmsize - seg->filesize));
+    }
+  }
+
+  mapped.imageBase = mapBase;
+  mapped.slide = mapBase - mapped.minVmAddr;
+  mapped.machHeaderAddr = mapBase + (uintptr_t)(headerVmAddr - mapped.minVmAddr);
+
+  outImage->imageBase = mapped.imageBase;
+  outImage->minVmAddr = mapped.minVmAddr;
+  outImage->maxVmAddr = mapped.maxVmAddr;
+  outImage->slide = mapped.slide;
+  outImage->machHeaderAddr = mapped.machHeaderAddr;
+  outImage->segCount = mapped.segCount;
+  for (uint32_t i = 0; i < mapped.segCount; i++) {
+    outImage->segs[i].vmaddr = mapped.segs[i].vmaddr;
+    outImage->segs[i].vmsize = mapped.segs[i].vmsize;
+    outImage->segs[i].fileoff = mapped.segs[i].fileoff;
+    outImage->segs[i].filesize = mapped.segs[i].filesize;
+    outImage->segs[i].initprot = mapped.segs[i].initprot;
+  }
+  return true;
+}
+
+static void apply_segment_protections_x86(const struct MappedImageX86* mapped)
+{
+  if (!mapped) {
+    return;
+  }
+  for (uint32_t i = 0; i < mapped->segCount; i++) {
+    const struct MappedSegment* seg = &mapped->segs[i];
+    if (seg->vmsize == 0 || seg->vmaddr < mapped->minVmAddr) {
+      continue;
+    }
+    uintptr_t segAddr = mapped->imageBase + (uintptr_t)(seg->vmaddr - mapped->minVmAddr);
+    uint64_t segSize = align_up_u64(seg->vmsize, 0x1000);
+    (void)syscall_mprotect((void*)segAddr, segSize, seg->initprot);
+  }
+}
+
+static const struct linkedit_data_command* find_chained_fixups_command(const void* image, uint64_t imageLen)
+{
+  if (!image || imageLen < sizeof(struct mach_header_64)) {
+    return 0;
+  }
+  const struct mach_header_64* mh = (const struct mach_header_64*)image;
+  if (mh->magic != MH_MAGIC_64 || (uint64_t)sizeof(*mh) + (uint64_t)mh->sizeofcmds > imageLen) {
+    return 0;
+  }
+  const struct load_command* lc = (const struct load_command*)((const char*)image + sizeof(*mh));
+  uint64_t cmdBytes = mh->sizeofcmds;
+  while (cmdBytes >= sizeof(struct load_command)) {
+    if (lc->cmdsize < sizeof(struct load_command) || lc->cmdsize > cmdBytes) {
+      return 0;
+    }
+    if (lc->cmd == LC_DYLD_CHAINED_FIXUPS) {
+      return (const struct linkedit_data_command*)lc;
     }
     cmdBytes -= lc->cmdsize;
-    lc = (struct load_command*)((char*)lc + lc->cmdsize);
+    lc = (const struct load_command*)((const char*)lc + lc->cmdsize);
   }
-  if (cmdBytes != 0) {
+  return 0;
+}
+
+static bool decode_import_entry(const uint8_t* imports, uint64_t importsLen, uint32_t importsFormat, uint32_t importIndex,
+                                uint32_t importsCount, int* outLibOrdinal, bool* outWeakImport, uint32_t* outNameOffset,
+                                int64_t* outImportAddend)
+{
+  if (!imports || !outLibOrdinal || !outWeakImport || !outNameOffset || !outImportAddend || importIndex >= importsCount) {
     return false;
   }
 
-  if (mh->filetype == MH_DYLIB) {
-    mh->filetype = MH_BUNDLE;
-    (void)sawIDDylib;
-  } else if (mh->filetype != MH_BUNDLE) {
+  if (importsFormat == DYLD_CHAINED_IMPORT) {
+    uint64_t need = (uint64_t)(importIndex + 1) * sizeof(struct dyld_chained_import);
+    if (need > importsLen) {
+      return false;
+    }
+    const struct dyld_chained_import* imp = (const struct dyld_chained_import*)imports + importIndex;
+    *outLibOrdinal = (int)(int8_t)imp->lib_ordinal;
+    *outWeakImport = (imp->weak_import != 0);
+    *outNameOffset = imp->name_offset;
+    *outImportAddend = 0;
+    return true;
+  }
+  if (importsFormat == DYLD_CHAINED_IMPORT_ADDEND) {
+    uint64_t need = (uint64_t)(importIndex + 1) * sizeof(struct dyld_chained_import_addend);
+    if (need > importsLen) {
+      return false;
+    }
+    const struct dyld_chained_import_addend* imp = (const struct dyld_chained_import_addend*)imports + importIndex;
+    *outLibOrdinal = (int)(int8_t)imp->lib_ordinal;
+    *outWeakImport = (imp->weak_import != 0);
+    *outNameOffset = imp->name_offset;
+    *outImportAddend = imp->addend;
+    return true;
+  }
+  if (importsFormat == DYLD_CHAINED_IMPORT_ADDEND64) {
+    uint64_t need = (uint64_t)(importIndex + 1) * sizeof(struct dyld_chained_import_addend64);
+    if (need > importsLen) {
+      return false;
+    }
+    const struct dyld_chained_import_addend64* imp = (const struct dyld_chained_import_addend64*)imports + importIndex;
+    *outLibOrdinal = (int)(int16_t)imp->lib_ordinal;
+    *outWeakImport = (imp->weak_import != 0);
+    *outNameOffset = (uint32_t)imp->name_offset;
+    *outImportAddend = (int64_t)imp->addend;
+    return true;
+  }
+
+  return false;
+}
+
+#define MAX_IMPORT_DEP_IMAGES 32u
+
+struct ImportDepImage {
+  const char* path;
+  uint64_t imageBase;
+};
+
+static bool gather_import_dep_images(const void* image, uint64_t imageLen, uint64_t shared_region_start,
+                                     const struct dyld_cache_header* cacheHeader, uint64_t cacheSlide,
+                                     struct ImportDepImage* outDeps, uint32_t* outDepCount)
+{
+  if (!image || !cacheHeader || !outDeps || !outDepCount || imageLen < sizeof(struct mach_header_64)) {
+    return false;
+  }
+  const struct mach_header_64* mh = (const struct mach_header_64*)image;
+  if (mh->magic != MH_MAGIC_64 || (uint64_t)sizeof(*mh) + (uint64_t)mh->sizeofcmds > imageLen) {
     return false;
   }
 
-  *outImage = copy;
-  *outLen = srcLen;
+  uint32_t depCount = 0;
+  const struct load_command* lc = (const struct load_command*)((const char*)image + sizeof(*mh));
+  uint64_t cmdBytes = mh->sizeofcmds;
+  while (cmdBytes >= sizeof(struct load_command)) {
+    if (lc->cmdsize < sizeof(struct load_command) || lc->cmdsize > cmdBytes) {
+      return false;
+    }
+
+    if (lc->cmd == LC_LOAD_DYLIB || lc->cmd == LC_LOAD_WEAK_DYLIB || lc->cmd == LC_REEXPORT_DYLIB || lc->cmd == LC_LAZY_LOAD_DYLIB ||
+        lc->cmd == LC_LOAD_UPWARD_DYLIB) {
+      if (depCount >= MAX_IMPORT_DEP_IMAGES || lc->cmdsize < sizeof(struct dylib_command)) {
+        return false;
+      }
+      const struct dylib_command* dc = (const struct dylib_command*)lc;
+      uint32_t nameOffset = dc->dylib.name.offset;
+      if (nameOffset >= lc->cmdsize) {
+        return false;
+      }
+      const char* path = (const char*)dc + nameOffset;
+      size_t maxNameLen = (size_t)(lc->cmdsize - nameOffset);
+      if (bounded_cstrlen(path, maxNameLen) == maxNameLen) {
+        return false;
+      }
+      outDeps[depCount].path = path;
+      outDeps[depCount].imageBase = find_cache_image(shared_region_start, cacheHeader, path, cacheSlide);
+      depCount++;
+    }
+
+    cmdBytes -= lc->cmdsize;
+    lc = (const struct load_command*)((const char*)lc + lc->cmdsize);
+  }
+
+  *outDepCount = depCount;
+  return (cmdBytes == 0);
+}
+
+static void* resolve_import_symbol_x86(const struct MappedImageX86* mapped, Dlsym_ptr dlsymFunc, const struct ImportDepImage* deps,
+                                       uint32_t depCount, uint64_t cacheSlide, const char* symbolName, int libOrdinal,
+                                       bool weakImport)
+{
+  if (!mapped || !symbolName) {
+    return 0;
+  }
+
+  void* addr = 0;
+  if (dlsymFunc) {
+    const char* lookup = symbolName;
+    if (lookup[0] == '_') {
+      lookup++;
+    }
+    if (lookup[0] != '\0') {
+      addr = dlsymFunc((void*)(intptr_t)-2, lookup);
+    }
+    if (!addr) {
+      addr = dlsymFunc((void*)(intptr_t)-2, symbolName);
+    }
+  }
+
+  if (libOrdinal == BIND_SPECIAL_DYLIB_SELF) {
+    if (!addr) {
+      addr = find_symbol((uint64_t)mapped->machHeaderAddr, symbolName, mapped->slide);
+    }
+  } else if (libOrdinal > 0) {
+    uint32_t depIndex = (uint32_t)(libOrdinal - 1);
+    if (!addr && deps && depIndex < depCount && deps[depIndex].imageBase != 0) {
+      addr = find_symbol(deps[depIndex].imageBase, symbolName, cacheSlide);
+    }
+  } else if (libOrdinal == BIND_SPECIAL_DYLIB_FLAT_LOOKUP || libOrdinal == BIND_SPECIAL_DYLIB_WEAK_LOOKUP ||
+             libOrdinal == BIND_SPECIAL_DYLIB_MAIN_EXECUTABLE) {
+    if (!addr) {
+      addr = find_symbol((uint64_t)mapped->machHeaderAddr, symbolName, mapped->slide);
+    }
+    if (!addr && deps) {
+      for (uint32_t i = 0; i < depCount; i++) {
+        if (deps[i].imageBase == 0) {
+          continue;
+        }
+        addr = find_symbol(deps[i].imageBase, symbolName, cacheSlide);
+        if (addr) {
+          break;
+        }
+      }
+    }
+  }
+
+  if (!addr && weakImport) {
+    return 0;
+  }
+  return addr;
+}
+
+static bool apply_chain_start_x86(const struct MappedImageX86* mapped, uintptr_t chainAddr, uintptr_t imageStart, uintptr_t imageEnd,
+                                  const uint8_t* imports, uint64_t importsLen, uint32_t importsFormat, uint32_t importsCount,
+                                  const char* symbols, uint64_t symbolsLen, Dlsym_ptr dlsymFunc,
+                                  const struct ImportDepImage* deps, uint32_t depCount, uint64_t cacheSlide)
+{
+  uintptr_t cursor = chainAddr;
+  uint32_t guard = 0;
+  while (1) {
+    if (cursor < imageStart || (cursor + sizeof(uint64_t)) > imageEnd) {
+      return false;
+    }
+    uint64_t raw = *(uint64_t*)(uintptr_t)cursor;
+    uint64_t next = (raw >> 51) & 0xFFF;
+    bool bind = ((raw >> 63) & 1) != 0;
+    uint64_t value = 0;
+
+    if (bind) {
+      uint32_t importIndex = (uint32_t)(raw & 0xFFFFFFu);
+      uint32_t chainAddend = (uint32_t)((raw >> 24) & 0xFFu);
+
+      int libOrdinal = 0;
+      bool weakImport = false;
+      uint32_t nameOffset = 0;
+      int64_t importAddend = 0;
+      if (!decode_import_entry(imports, importsLen, importsFormat, importIndex, importsCount, &libOrdinal, &weakImport, &nameOffset,
+                               &importAddend)) {
+        return false;
+      }
+      if (nameOffset >= symbolsLen) {
+        return false;
+      }
+      const char* symName = symbols + nameOffset;
+      size_t maxName = (size_t)(symbolsLen - nameOffset);
+      if (bounded_cstrlen(symName, maxName) == maxName) {
+        return false;
+      }
+
+      void* resolved = resolve_import_symbol_x86(mapped, dlsymFunc, deps, depCount, cacheSlide, symName, libOrdinal, weakImport);
+      if (!resolved && !weakImport) {
+        return false;
+      }
+      if (resolved) {
+        value = (uint64_t)(uintptr_t)resolved + (uint64_t)importAddend + (uint64_t)chainAddend;
+      } else {
+        value = 0;
+      }
+    } else {
+      uint64_t target = raw & ((1ULL << 36) - 1);
+      uint64_t high8 = (raw >> 36) & 0xFF;
+      value = ((high8 << 56) | target) + mapped->slide;
+    }
+
+    *(uint64_t*)(uintptr_t)cursor = value;
+    if (next == 0) {
+      break;
+    }
+    cursor += (uintptr_t)(next * 4);
+    if (++guard > 0x20000u) {
+      return false;
+    }
+  }
   return true;
+}
+
+static bool apply_chained_fixups_x86(const struct MappedImageX86* mapped, const void* image, uint64_t imageLen, uint64_t shared_region_start,
+                                     const struct dyld_cache_header* cacheHeader, uint64_t cacheSlide, Dlsym_ptr dlsymFunc)
+{
+  if (!mapped || !image || !cacheHeader) {
+    return false;
+  }
+
+  const struct linkedit_data_command* fixupsCmd = find_chained_fixups_command(image, imageLen);
+  if (!fixupsCmd) {
+    return true; // image has no chained fixups
+  }
+  if ((uint64_t)fixupsCmd->dataoff + (uint64_t)fixupsCmd->datasize > imageLen) {
+    return false;
+  }
+  const uint8_t* chainData = (const uint8_t*)image + fixupsCmd->dataoff;
+  uint64_t chainLen = fixupsCmd->datasize;
+  if (chainLen < sizeof(struct dyld_chained_fixups_header)) {
+    return false;
+  }
+
+  const struct dyld_chained_fixups_header* fixHdr = (const struct dyld_chained_fixups_header*)chainData;
+  if (fixHdr->starts_offset >= chainLen || fixHdr->imports_offset >= chainLen || fixHdr->symbols_offset >= chainLen) {
+    return false;
+  }
+
+  const uint8_t* imports = chainData + fixHdr->imports_offset;
+  uint64_t importsLen = chainLen - fixHdr->imports_offset;
+  const char* symbols = (const char*)(chainData + fixHdr->symbols_offset);
+  uint64_t symbolsLen = chainLen - fixHdr->symbols_offset;
+
+  struct ImportDepImage deps[MAX_IMPORT_DEP_IMAGES];
+  uint32_t depCount = 0;
+  if (!gather_import_dep_images(image, imageLen, shared_region_start, cacheHeader, cacheSlide, deps, &depCount)) {
+    return false;
+  }
+
+  const uint8_t* startsRaw = chainData + fixHdr->starts_offset;
+  if ((uint64_t)(chainLen - fixHdr->starts_offset) < sizeof(uint32_t)) {
+    return false;
+  }
+  const struct dyld_chained_starts_in_image* startsImage = (const struct dyld_chained_starts_in_image*)startsRaw;
+  uint32_t segCount = startsImage->seg_count;
+  if ((uint64_t)(chainLen - fixHdr->starts_offset) < (sizeof(uint32_t) + (uint64_t)segCount * sizeof(uint32_t))) {
+    return false;
+  }
+
+  uintptr_t imageStart = mapped->imageBase;
+  uintptr_t imageEnd = mapped->imageBase + (uintptr_t)(mapped->maxVmAddr - mapped->minVmAddr);
+
+  for (uint32_t segIndex = 0; segIndex < segCount; segIndex++) {
+    uint32_t segInfoOffset = startsImage->seg_info_offset[segIndex];
+    if (segInfoOffset == 0) {
+      continue;
+    }
+
+    if ((uint64_t)segInfoOffset > (chainLen - fixHdr->starts_offset)) {
+      return false;
+    }
+    const uint8_t* segInfoRaw = startsRaw + segInfoOffset;
+    if ((uint64_t)(chainData + chainLen - segInfoRaw) < sizeof(struct dyld_chained_starts_in_segment)) {
+      return false;
+    }
+
+    const struct dyld_chained_starts_in_segment* startsSeg = (const struct dyld_chained_starts_in_segment*)segInfoRaw;
+    if (startsSeg->size < sizeof(struct dyld_chained_starts_in_segment)) {
+      return false;
+    }
+    if ((uint64_t)startsSeg->size > (uint64_t)(chainData + chainLen - segInfoRaw)) {
+      return false;
+    }
+    if (startsSeg->pointer_format != DYLD_CHAINED_PTR_64_OFFSET) {
+      return false;
+    }
+    if (startsSeg->page_size == 0) {
+      return false;
+    }
+
+    uint64_t pageArrayNeed = (uint64_t)startsSeg->page_count * sizeof(uint16_t);
+    uint64_t fixedPrefix = sizeof(struct dyld_chained_starts_in_segment) - sizeof(uint16_t);
+    if (startsSeg->size < (fixedPrefix + pageArrayNeed)) {
+      return false;
+    }
+
+    if (startsSeg->segment_offset < mapped->minVmAddr) {
+      return false;
+    }
+    uintptr_t segRuntimeBase = mapped->imageBase + (uintptr_t)(startsSeg->segment_offset - mapped->minVmAddr);
+    const uint16_t* pageStarts = startsSeg->page_start;
+    const uint16_t* extras = pageStarts + startsSeg->page_count;
+
+    for (uint32_t pageIndex = 0; pageIndex < startsSeg->page_count; pageIndex++) {
+      uint16_t pageStart = pageStarts[pageIndex];
+      if (pageStart == DYLD_CHAINED_PTR_START_NONE) {
+        continue;
+      }
+
+      if (pageStart & DYLD_CHAINED_PTR_START_MULTI) {
+        uint32_t listIndex = (uint32_t)(pageStart & ~DYLD_CHAINED_PTR_START_MULTI);
+        uint32_t guard = 0;
+        while (1) {
+          uintptr_t extraAddr = (uintptr_t)&extras[listIndex];
+          if ((extraAddr + sizeof(uint16_t)) > ((uintptr_t)startsSeg + startsSeg->size)) {
+            return false;
+          }
+          uint16_t entry = extras[listIndex++];
+          bool isLast = ((entry & DYLD_CHAINED_PTR_START_LAST) != 0);
+          uint16_t startOff = (uint16_t)(entry & ~DYLD_CHAINED_PTR_START_LAST);
+          uintptr_t chainAddr = segRuntimeBase + (uintptr_t)pageIndex * startsSeg->page_size + startOff;
+          if (!apply_chain_start_x86(mapped, chainAddr, imageStart, imageEnd, imports, importsLen, fixHdr->imports_format,
+                                     fixHdr->imports_count, symbols, symbolsLen, dlsymFunc, deps, depCount, cacheSlide)) {
+            return false;
+          }
+          if (isLast) {
+            break;
+          }
+          if (++guard > 0x20000u) {
+            return false;
+          }
+        }
+      } else {
+        uintptr_t chainAddr = segRuntimeBase + (uintptr_t)pageIndex * startsSeg->page_size + pageStart;
+        if (!apply_chain_start_x86(mapped, chainAddr, imageStart, imageEnd, imports, importsLen, fixHdr->imports_format,
+                                   fixHdr->imports_count, symbols, symbolsLen, dlsymFunc, deps, depCount, cacheSlide)) {
+          return false;
+        }
+      }
+    }
+  }
+
+  return true;
+}
+
+typedef void (*init_func_x86_t)(int, const char**, const char**, const char**, void*);
+
+static void run_initializers_x86(const struct MappedImageX86* mapped)
+{
+  if (!mapped || !mapped->machHeaderAddr) {
+    return;
+  }
+  uintptr_t imageStart = mapped->imageBase;
+  uintptr_t imageEnd = mapped->imageBase + (uintptr_t)(mapped->maxVmAddr - mapped->minVmAddr);
+
+  const struct mach_header_64* mh = (const struct mach_header_64*)(uintptr_t)mapped->machHeaderAddr;
+  const struct load_command* lc = (const struct load_command*)((const char*)mh + sizeof(*mh));
+  uint64_t cmdBytes = mh->sizeofcmds;
+  while (cmdBytes >= sizeof(struct load_command)) {
+    if (lc->cmdsize < sizeof(struct load_command) || lc->cmdsize > cmdBytes) {
+      return;
+    }
+    if (lc->cmd == LC_SEGMENT_64) {
+      const struct segment_command_64* seg = (const struct segment_command_64*)lc;
+      const struct section_64* sect = (const struct section_64*)((const char*)seg + sizeof(*seg));
+      for (uint32_t i = 0; i < seg->nsects; i++) {
+        uint32_t sectionType = (sect[i].flags & SECTION_TYPE);
+        if (sectionType == S_INIT_FUNC_OFFSETS) {
+          if (sect[i].addr < mapped->minVmAddr) {
+            continue;
+          }
+          uintptr_t secRuntime = mapped->imageBase + (uintptr_t)(sect[i].addr - mapped->minVmAddr);
+          uint64_t count = sect[i].size / sizeof(uint32_t);
+          uint32_t* offsets = (uint32_t*)(uintptr_t)secRuntime;
+          for (uint64_t n = 0; n < count; n++) {
+            uint32_t off = offsets[n];
+            if (off == 0) {
+              continue;
+            }
+            uintptr_t initAddr = (uintptr_t)(mapped->slide + off);
+            if (initAddr < imageStart || initAddr >= imageEnd) {
+              continue;
+            }
+            init_func_x86_t init_func = (init_func_x86_t)initAddr;
+            init_func(0, 0, 0, 0, 0);
+          }
+        } else if (sectionType == S_MOD_INIT_FUNC_POINTERS) {
+          if (sect[i].addr < mapped->minVmAddr) {
+            continue;
+          }
+          uintptr_t secRuntime = mapped->imageBase + (uintptr_t)(sect[i].addr - mapped->minVmAddr);
+          uint64_t count = sect[i].size / sizeof(uint64_t);
+          uint64_t* initPtrs = (uint64_t*)(uintptr_t)secRuntime;
+          for (uint64_t n = 0; n < count; n++) {
+            uint64_t ptr = initPtrs[n];
+            if (ptr != 0) {
+              uintptr_t initAddr = (uintptr_t)ptr;
+              if (initAddr < imageStart || initAddr >= imageEnd) {
+                continue;
+              }
+              init_func_x86_t init_func = (init_func_x86_t)initAddr;
+              init_func(0, 0, 0, 0, 0);
+            }
+          }
+        }
+      }
+    }
+    cmdBytes -= lc->cmdsize;
+    lc = (const struct load_command*)((const char*)lc + lc->cmdsize);
+  }
 }
 
 /*
@@ -986,55 +1614,35 @@ __attribute__((used, noinline)) int beignet_loader(void* buffer_ro, uint64_t buf
   }
 
 #if defined(__x86_64__)
-  // x86_64 path: always use NS* in-memory loading. For MH_DYLIB, normalize to
-  // MH_BUNDLE first to keep loading memory-only.
-  NSCreateObjectFileImageFromMemory_ptr NSCreateObjectFileImageFromMemory_func =
-      (NSCreateObjectFileImageFromMemory_ptr)find_symbol(libdyld, "_NSCreateObjectFileImageFromMemory", slide);
-  NSLinkModule_ptr NSLinkModule_func = (NSLinkModule_ptr)find_symbol(libdyld, "_NSLinkModule", slide);
-  NSLookupSymbolInModule_ptr NSLookupSymbolInModule_func =
-      (NSLookupSymbolInModule_ptr)find_symbol(libdyld, "_NSLookupSymbolInModule", slide);
-  NSAddressOfSymbol_ptr NSAddressOfSymbol_func = (NSAddressOfSymbol_ptr)find_symbol(libdyld, "_NSAddressOfSymbol", slide);
-  NSDestroyObjectFileImage_ptr NSDestroyObjectFileImage_func =
-      (NSDestroyObjectFileImage_ptr)find_symbol(libdyld, "_NSDestroyObjectFileImage", slide);
-
-  if (!NSCreateObjectFileImageFromMemory_func || !NSLinkModule_func || !NSLookupSymbolInModule_func || !NSAddressOfSymbol_func ||
-      !NSDestroyObjectFileImage_func) {
+  Dlsym_ptr dlsym_func = (Dlsym_ptr)find_symbol(libdyld, "_dlsym", slide);
+  if (!dlsym_func) {
     return 4;
   }
 
-  void* nsImage = 0;
-  uint64_t nsImageLen = 0;
-  if (!prepare_ns_memory_image((const void*)(uintptr_t)buffer, bufferLen, &nsImage, &nsImageLen)) {
-    return 16;
+  struct MappedImageX86 mappedImage;
+  if (!map_macho_image_x86((const void*)(uintptr_t)buffer, bufferLen, &mappedImage)) {
+    return 5;
   }
 
-  void* ofi = 0;
-  int ofiRc = NSCreateObjectFileImageFromMemory_func((const void*)nsImage, (size_t)nsImageLen, &ofi);
-  if (ofiRc != 1 || !ofi) {
-    return 16;
+  if (!apply_chained_fixups_x86(&mappedImage, (const void*)(uintptr_t)buffer, bufferLen, shared_region_start, header, slide,
+                                dlsym_func)) {
+    return 9;
   }
 
-  // NSLINKMODULE_OPTION_RETURN_ON_ERROR (0x4)
-  void* module = NSLinkModule_func(ofi, "mem", 0x4);
-  if (!module) {
-    (void)NSDestroyObjectFileImage_func(ofi);
-    return 17;
-  }
+  apply_segment_protections_x86(&mappedImage);
+  // run_initializers_x86(&mappedImage);
 
-  void* sym = NSLookupSymbolInModule_func(module, entry_symbol);
-  if (!sym) {
-    (void)NSDestroyObjectFileImage_func(ofi);
+  void* x86_addr_entry = find_symbol((uint64_t)mappedImage.machHeaderAddr, entry_symbol, mappedImage.slide);
+  if (!x86_addr_entry) {
     return 12;
   }
-  void* ns_addr_entry = NSAddressOfSymbol_func(sym);
-  if (!ns_addr_entry) {
-    (void)NSDestroyObjectFileImage_func(ofi);
-    return 12;
+  uintptr_t imageStart = mappedImage.imageBase;
+  uintptr_t imageEnd = mappedImage.imageBase + (uintptr_t)(mappedImage.maxVmAddr - mappedImage.minVmAddr);
+  if ((uintptr_t)x86_addr_entry < imageStart || (uintptr_t)x86_addr_entry >= imageEnd) {
+    return 46;
   }
-
-  void (*ns_entry_func)(void) = (void (*)(void))ns_addr_entry;
-  ns_entry_func();
-  (void)NSDestroyObjectFileImage_func(ofi);
+  void (*x86_entry_func)(void) = (void (*)(void))x86_addr_entry;
+  x86_entry_func();
   return 0;
 #endif
 
@@ -1297,3 +1905,4 @@ int main(int argc, char** argv)
   (void)beignet_loader(0, 0, 0);
   return 0;
 }
+  typedef void (*init_func_x86_t)(int, const char**, const char**, const char**, void*);

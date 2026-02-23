@@ -8,7 +8,7 @@ import (
 	keystone "github.com/moloch--/go-keystone"
 )
 
-const amd64BootstrapLen = 59
+const amd64BootstrapLen = 67
 
 var (
 	amd64KeystoneOnce sync.Once
@@ -65,7 +65,10 @@ func buildAMD64Bootstrap(payloadOffset, payloadSize, symbolOffset, loaderEntryOf
 	// rax = base + loaderEntryOffsetAbs
 	fmt.Fprintf(&sb, "movabs rax, 0x%X\n", loaderEntryOffsetAbs)
 	sb.WriteString("add rax, r9\n")
-	sb.WriteString("call rax\n") // keeps stack alignment for System V ABI
+	// System V ABI: align stack before calling into loader.
+	sb.WriteString("sub rsp, 8\n")
+	sb.WriteString("call rax\n")
+	sb.WriteString("add rsp, 8\n")
 	sb.WriteString("ret\n")
 
 	b, err := assembleAMD64(sb.String())

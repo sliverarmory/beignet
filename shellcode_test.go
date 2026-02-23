@@ -104,9 +104,8 @@ __attribute__((visibility("default"))) void StartW(void) {
 		t.Fatalf("write marker dylib source: %v", err)
 	}
 
-	// We intentionally build a Mach-O bundle here because dyld's
-	// NSCreateObjectFileImageFromMemory path (used by the x86_64 loader to work
-	// under Rosetta) only accepts MH_BUNDLE payloads.
+	// Keep this Rosetta fixture as a small C bundle. The amd64 loader now maps
+	// payload images directly from memory and supports normal Mach-O fixups.
 	cmd := exec.Command("clang", "-target", "x86_64-apple-macos13", "-bundle", "-fPIC", "-o", bundlePath, src)
 	cmd.Env = os.Environ()
 	out, err := cmd.CombinedOutput()
