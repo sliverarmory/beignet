@@ -11,9 +11,9 @@
  * Diskless requirement:
  * - The primary load path must never write to disk (no open/write/unlink temp files).
  * - It uses dyld4's JustInTimeLoader to load a Mach-O image from memory.
- * - Under Rosetta 2 (x86_64 translation), dyld4 internals are fragile and we
- *   fall back to legacy NS* APIs for MH_BUNDLE payloads. Note: this fallback
- *   may create and unlink a temporary file.
+ * - On x86_64, we use legacy NS* APIs with an in-memory MH_BUNDLE image.
+ *   MH_DYLIB payloads are normalized to MH_BUNDLE in a private copy before
+ *   NSCreateObjectFileImageFromMemory() to avoid disk-backed fallback paths.
  *
  * Platform:
  * - darwin/arm64 and darwin/amd64
@@ -262,6 +262,8 @@ typedef void* (*NSLookupSymbolInModule_ptr)(void* module, const char* symbolName
 typedef void* (*NSAddressOfSymbol_ptr)(void* symbol);
 typedef bool (*NSDestroyObjectFileImage_ptr)(void* ofi);
 
+static void* syscall_mmap(void* addr, uint64_t length, int prot, int flags, int fd, uint64_t offset);
+
 static int string_compare(const char* s1, const char* s2)
 {
   while (*s1 != '\0' && *s1 == *s2) {
@@ -279,6 +281,56 @@ static void* memcpy2(void* dest, const void* src, size_t len)
     *d++ = *s++;
   }
   return dest;
+}
+
+static bool prepare_ns_memory_image(const void* src, uint64_t srcLen, void** outImage, uint64_t* outLen)
+{
+  if (!src || !outImage || !outLen || srcLen < sizeof(struct mach_header_64)) {
+    return false;
+  }
+
+  void* copy = syscall_mmap(0, srcLen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  if (copy == (void*)-1 || copy == 0) {
+    return false;
+  }
+  memcpy2(copy, src, (size_t)srcLen);
+
+  struct mach_header_64* mh = (struct mach_header_64*)copy;
+  if (mh->magic != MH_MAGIC_64) {
+    return false;
+  }
+  if (mh->sizeofcmds > srcLen || (uint64_t)sizeof(*mh) + (uint64_t)mh->sizeofcmds > srcLen) {
+    return false;
+  }
+
+  struct load_command* lc = (struct load_command*)((char*)mh + sizeof(*mh));
+  uint64_t cmdBytes = mh->sizeofcmds;
+  bool sawIDDylib = false;
+  while (cmdBytes >= sizeof(struct load_command)) {
+    if (lc->cmdsize < sizeof(struct load_command) || lc->cmdsize > cmdBytes) {
+      return false;
+    }
+    if (lc->cmd == LC_ID_DYLIB) {
+      sawIDDylib = true;
+      lc->cmd = LC_LAZY_LOAD_DYLIB;
+    }
+    cmdBytes -= lc->cmdsize;
+    lc = (struct load_command*)((char*)lc + lc->cmdsize);
+  }
+  if (cmdBytes != 0) {
+    return false;
+  }
+
+  if (mh->filetype == MH_DYLIB) {
+    mh->filetype = MH_BUNDLE;
+    (void)sawIDDylib;
+  } else if (mh->filetype != MH_BUNDLE) {
+    return false;
+  }
+
+  *outImage = copy;
+  *outLen = srcLen;
+  return true;
 }
 
 /*
@@ -934,53 +986,56 @@ __attribute__((used, noinline)) int beignet_loader(void* buffer_ro, uint64_t buf
   }
 
 #if defined(__x86_64__)
-  // When running x86_64 code under Rosetta 2, dyld4 internals are fragile.
-  // Prefer the libdyld legacy NS* wrappers, which are stable for MH_BUNDLE
-  // payloads.
-  if (header->rosettaReadOnlyAddr != 0 || header->rosettaReadWriteAddr != 0) {
-    NSCreateObjectFileImageFromMemory_ptr NSCreateObjectFileImageFromMemory_func =
-        (NSCreateObjectFileImageFromMemory_ptr)find_symbol(libdyld, "_NSCreateObjectFileImageFromMemory", slide);
-    NSLinkModule_ptr NSLinkModule_func = (NSLinkModule_ptr)find_symbol(libdyld, "_NSLinkModule", slide);
-    NSLookupSymbolInModule_ptr NSLookupSymbolInModule_func =
-        (NSLookupSymbolInModule_ptr)find_symbol(libdyld, "_NSLookupSymbolInModule", slide);
-    NSAddressOfSymbol_ptr NSAddressOfSymbol_func = (NSAddressOfSymbol_ptr)find_symbol(libdyld, "_NSAddressOfSymbol", slide);
-    NSDestroyObjectFileImage_ptr NSDestroyObjectFileImage_func =
-        (NSDestroyObjectFileImage_ptr)find_symbol(libdyld, "_NSDestroyObjectFileImage", slide);
+  // x86_64 path: always use NS* in-memory loading. For MH_DYLIB, normalize to
+  // MH_BUNDLE first to keep loading memory-only.
+  NSCreateObjectFileImageFromMemory_ptr NSCreateObjectFileImageFromMemory_func =
+      (NSCreateObjectFileImageFromMemory_ptr)find_symbol(libdyld, "_NSCreateObjectFileImageFromMemory", slide);
+  NSLinkModule_ptr NSLinkModule_func = (NSLinkModule_ptr)find_symbol(libdyld, "_NSLinkModule", slide);
+  NSLookupSymbolInModule_ptr NSLookupSymbolInModule_func =
+      (NSLookupSymbolInModule_ptr)find_symbol(libdyld, "_NSLookupSymbolInModule", slide);
+  NSAddressOfSymbol_ptr NSAddressOfSymbol_func = (NSAddressOfSymbol_ptr)find_symbol(libdyld, "_NSAddressOfSymbol", slide);
+  NSDestroyObjectFileImage_ptr NSDestroyObjectFileImage_func =
+      (NSDestroyObjectFileImage_ptr)find_symbol(libdyld, "_NSDestroyObjectFileImage", slide);
 
-    if (!NSCreateObjectFileImageFromMemory_func || !NSLinkModule_func || !NSLookupSymbolInModule_func || !NSAddressOfSymbol_func ||
-        !NSDestroyObjectFileImage_func) {
-      return 4;
-    }
-
-    void* ofi = 0;
-    int ofiRc = NSCreateObjectFileImageFromMemory_func((const void*)(uintptr_t)buffer, (size_t)bufferLen, &ofi);
-    if (ofiRc != 1 || !ofi) {
-      return 16;
-    }
-
-    // NSLINKMODULE_OPTION_RETURN_ON_ERROR (0x4)
-    void* module = NSLinkModule_func(ofi, "mem", 0x4);
-    if (!module) {
-      (void)NSDestroyObjectFileImage_func(ofi);
-      return 17;
-    }
-
-    void* sym = NSLookupSymbolInModule_func(module, entry_symbol);
-    if (!sym) {
-      (void)NSDestroyObjectFileImage_func(ofi);
-      return 12;
-    }
-    void* addr_entry = NSAddressOfSymbol_func(sym);
-    if (!addr_entry) {
-      (void)NSDestroyObjectFileImage_func(ofi);
-      return 12;
-    }
-
-    void (*entry_func)(void) = (void (*)(void))addr_entry;
-    entry_func();
-    (void)NSDestroyObjectFileImage_func(ofi);
-    return 0;
+  if (!NSCreateObjectFileImageFromMemory_func || !NSLinkModule_func || !NSLookupSymbolInModule_func || !NSAddressOfSymbol_func ||
+      !NSDestroyObjectFileImage_func) {
+    return 4;
   }
+
+  void* nsImage = 0;
+  uint64_t nsImageLen = 0;
+  if (!prepare_ns_memory_image((const void*)(uintptr_t)buffer, bufferLen, &nsImage, &nsImageLen)) {
+    return 16;
+  }
+
+  void* ofi = 0;
+  int ofiRc = NSCreateObjectFileImageFromMemory_func((const void*)nsImage, (size_t)nsImageLen, &ofi);
+  if (ofiRc != 1 || !ofi) {
+    return 16;
+  }
+
+  // NSLINKMODULE_OPTION_RETURN_ON_ERROR (0x4)
+  void* module = NSLinkModule_func(ofi, "mem", 0x4);
+  if (!module) {
+    (void)NSDestroyObjectFileImage_func(ofi);
+    return 17;
+  }
+
+  void* sym = NSLookupSymbolInModule_func(module, entry_symbol);
+  if (!sym) {
+    (void)NSDestroyObjectFileImage_func(ofi);
+    return 12;
+  }
+  void* ns_addr_entry = NSAddressOfSymbol_func(sym);
+  if (!ns_addr_entry) {
+    (void)NSDestroyObjectFileImage_func(ofi);
+    return 12;
+  }
+
+  void (*ns_entry_func)(void) = (void (*)(void))ns_addr_entry;
+  ns_entry_func();
+  (void)NSDestroyObjectFileImage_func(ofi);
+  return 0;
 #endif
 
   // Resolve the dyld4 internals we need from /usr/lib/dyld.
@@ -1029,16 +1084,8 @@ __attribute__((used, noinline)) int beignet_loader(void* buffer_ro, uint64_t buf
     }
   }
 #elif defined(__x86_64__)
-  // Optional helpers for working with dyld's internal write-protected allocator/state.
-  MemoryManager_ptr MemoryManager_func = (MemoryManager_ptr)find_symbol(dyld, "__ZN3lsl13MemoryManager13memoryManagerEv", slide);
-  LockGuard_ptr LockGuard_func = (LockGuard_ptr)find_symbol(dyld, "__ZN3lsl13MemoryManager9lockGuardEv", slide);
-  WriteProtect_ptr WriteProtect_func = (WriteProtect_ptr)find_symbol(dyld, "__ZN3lsl13MemoryManager12writeProtectEb", slide);
-  LockUnlock_ptr LockUnlock_func = (LockUnlock_ptr)find_symbol(dyld, "__ZN3lsl4Lock6unlockEv", slide);
-
-  void* mm = 0;
-  if (MemoryManager_func) {
-    mm = MemoryManager_func();
-  }
+  // Under Rosetta/x86_64, direct lsl::MemoryManager manipulation is unstable
+  // across dyld builds. Keep the amd64 path on dyld RuntimeState APIs only.
 #endif
 
   // Allocate a region large enough for the mapped Mach-O.
@@ -1195,19 +1242,7 @@ __attribute__((used, noinline)) int beignet_loader(void* buffer_ro, uint64_t buf
     doLoadWithWritableDyldState();
   }
 #elif defined(__x86_64__)
-  void (^doLoadWithWritableDyldState)(void) = ^(){
-    bool entered = enter_writable_dyld_state(mm, LockGuard_func, WriteProtect_func, LockUnlock_func);
-    doLoad();
-    if (entered) {
-      exit_writable_dyld_state(mm, LockGuard_func, WriteProtect_func, LockUnlock_func);
-    }
-  };
-
-  if (mm && LockGuard_func && WriteProtect_func && LockUnlock_func) {
-    doLoadWithWritableDyldState();
-  } else {
-    doLoad();
-  }
+  doLoad();
 #else
   doLoad();
 #endif
